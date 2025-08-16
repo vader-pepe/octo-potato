@@ -26,10 +26,7 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_DB)]
     db: PathBuf,
 
-    #[arg(
-        long,
-        default_value = "https://discord.com/api/webhooks/1273513332497977527/v9GdKJiYicX_S-JrS8YCtJdJxebKv3WndUV0ReYnWGWM83NPdzvEW80WA72Vxv5892bC"
-    )]
+    #[arg(long, default_value = "")]
     webhook: String,
 
     #[command(subcommand)]
