@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
+use dotenv::dotenv;
 use rand::Rng;
 use rayon::prelude::*;
 use reqwest::blocking::Client;
@@ -13,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-const DEFAULT_DB: &str = "app-data/chunks.db";
+const DEFAULT_DB: &str = "app-data/store.db";
 /// 2 MB (decimal) = 2,000,000 bytes. Change if you want 2 MiB.
 const DEFAULT_CHUNK_SIZE: usize = 2_000_000;
 
@@ -61,6 +62,8 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
+    dotenv().ok();
+    let proxy_base = std::env::var("PROXY_BASE").expect("PROXY_BASE must be set.");
     let cli = Cli::parse();
     let mut conn =
         Connection::open(&cli.db).with_context(|| format!("opening db: {}", cli.db.display()))?;
@@ -72,11 +75,12 @@ fn main() -> Result<()> {
         }
         Commands::Ingest { path, chunk_size } => {
             init_schema(&mut conn)?;
+            let webhook = std::env::var("WEBHOOK").expect("WEBHOOK must be set.");
             let file_id = ingest_file(
                 &mut conn,
                 &path,
                 chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE),
-                &cli.webhook,
+                &webhook,
             )?;
             println!("Ingested '{}' with file_id={}", path.display(), file_id);
         }
@@ -84,13 +88,13 @@ fn main() -> Result<()> {
             list_files(&mut conn)?;
         }
         Commands::Export { file_id, out } => {
-            export_file(&mut conn, file_id, Some(out))?;
+            export_file(&mut conn, file_id, &proxy_base, Some(out))?;
         }
         Commands::Verify { file_id } => {
             verify_file(&mut conn, file_id)?;
         }
         Commands::Stream { file_id } => {
-            export_to_stdout(&mut conn, file_id)?;
+            export_to_stdout(&mut conn, file_id, &proxy_base)?;
         }
     }
 
@@ -120,21 +124,17 @@ fn list_files(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-fn export_file(conn: &mut Connection, file_id: i64, out: Option<PathBuf>) -> Result<()> {
-    let filename: String = conn.query_row(
-        "SELECT filename FROM files WHERE id = ?1",
-        params![file_id],
-        |row| row.get(0),
-    )?;
+fn export_file(
+    conn: &mut Connection,
+    file_id: i64,
+    proxy_base: &str,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    // fetch original filename
+    let mut stmt = conn.prepare("SELECT filename FROM files WHERE id = ?1")?;
+    let filename: String = stmt.query_row(params![file_id], |row| row.get(0))?;
 
-    // TODO: isi ini
-    refresh_all_chunks(conn, "", "")?;
-    let mut stmt =
-        conn.prepare("SELECT idx, url FROM file_chunks WHERE file_id = ?1 ORDER BY idx ASC")?;
-    let rows = stmt.query_map(params![file_id], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-    })?;
-
+    // prepare output writer
     let mut out_writer: Box<dyn Write> = if let Some(path) = out {
         if path.to_string_lossy() == "-" {
             Box::new(std::io::stdout())
@@ -145,17 +145,28 @@ fn export_file(conn: &mut Connection, file_id: i64, out: Option<PathBuf>) -> Res
         Box::new(File::create(filename)?)
     };
 
+    // query chunks
+    let mut stmt =
+        conn.prepare("SELECT idx, url FROM file_chunks WHERE file_id = ?1 ORDER BY idx ASC")?;
+    let rows = stmt.query_map(params![file_id], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+
     let client = Client::new();
     for row in rows {
-        let (_idx, url) = row?;
-        let mut resp = client.get(&url).send()?;
+        let (idx, url) = row?;
+        // wrap original discord cdn url with proxy
+        let proxied_url = format!("{proxy_base}/?{url}");
+
+        eprintln!("Downloading chunk {idx} via {proxied_url}");
+        let mut resp = client.get(&proxied_url).send()?;
         std::io::copy(&mut resp, &mut out_writer)?;
     }
 
     Ok(())
 }
 
-fn export_to_stdout(conn: &mut Connection, file_id: i64) -> Result<()> {
+fn export_to_stdout(conn: &mut Connection, file_id: i64, proxy_base: &str) -> Result<()> {
     let mut stmt =
         conn.prepare("SELECT idx, url FROM file_chunks WHERE file_id = ?1 ORDER BY idx ASC")?;
     let chunks = stmt.query_map([file_id], |row| {
@@ -169,52 +180,11 @@ fn export_to_stdout(conn: &mut Connection, file_id: i64) -> Result<()> {
     let mut handle = stdout.lock();
 
     for chunk in chunks {
-        let (_idx, url) = chunk?;
-        let mut resp = client.get(&url).send()?;
+        let (idx, url) = chunk?;
+        let proxied_url = format!("{proxy_base}/?{url}");
+        eprintln!("Downloading chunk {idx} via {proxied_url}");
+        let mut resp = client.get(&proxied_url).send()?;
         io::copy(&mut resp, &mut handle)?;
-    }
-
-    Ok(())
-}
-
-/// Refreshes a Discord media URL using message_id
-fn refresh_chunk_url(
-    client: &Client,
-    bot_token: &str,
-    channel_id: &str,
-    message_id: &str,
-) -> Result<String> {
-    let resp: serde_json::Value = client
-        .get(format!(
-            "https://discord.com/api/v10/channels/{}/messages/{}",
-            channel_id, message_id
-        ))
-        .header("Authorization", format!("Bot {}", bot_token))
-        .send()?
-        .json()?;
-
-    let url = resp["attachments"][0]["url"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing attachment in refreshed message"))?
-        .to_string();
-    Ok(url)
-}
-
-/// Example: refresh all chunks before streaming
-fn refresh_all_chunks(conn: &mut Connection, bot_token: &str, channel_id: &str) -> Result<()> {
-    let client = Client::new();
-    let mut stmt = conn.prepare("SELECT id, message_id FROM file_chunks")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-    })?;
-
-    for row in rows {
-        let (chunk_id, message_id) = row?;
-        let new_url = refresh_chunk_url(&client, bot_token, channel_id, &message_id)?;
-        conn.execute(
-            "UPDATE file_chunks SET url=?1 WHERE id=?2",
-            params![new_url, chunk_id],
-        )?;
     }
 
     Ok(())
@@ -356,6 +326,7 @@ fn init_schema(conn: &mut Connection) -> Result<()> {
             file_id INTEGER NOT NULL,
             idx INTEGER NOT NULL,
             url TEXT NOT NULL,
+            message_id TEXT NOT NULL,
             PRIMARY KEY(file_id, idx)
         )",
         [],
