@@ -67,6 +67,10 @@ enum Commands {
 fn main() -> Result<()> {
     dotenv().ok();
     let cli = Cli::parse();
+    let data_dir = Path::new("app-data");
+    if !data_dir.exists() {
+        fs::create_dir_all(data_dir)?;
+    }
     let mut conn =
         Connection::open(&cli.db).with_context(|| format!("opening db: {}", cli.db.display()))?;
 
