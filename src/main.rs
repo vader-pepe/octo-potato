@@ -15,8 +15,7 @@ use std::thread;
 use std::time::Duration;
 
 const DEFAULT_DB: &str = "app-data/store.db";
-/// 2 MB (decimal) = 2,000,000 bytes. Change if you want 2 MiB.
-const DEFAULT_CHUNK_SIZE: usize = 2_000_000;
+const DEFAULT_CHUNK_SIZE: usize = 7_000_000;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -27,7 +26,7 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_DB)]
     db: PathBuf,
 
-    #[arg(long, default_value = "")]
+    #[arg(long)]
     webhook: String,
 
     #[command(subcommand)]
@@ -48,6 +47,8 @@ enum Commands {
     },
     /// List stored files
     List,
+    /// List directories
+    ListDirs,
     /// Export (reconstruct) a stored file by ID
     Export {
         /// ID from the `files` table
@@ -59,11 +60,12 @@ enum Commands {
     Verify { file_id: i64 },
     /// Stream the data
     Stream { file_id: i64 },
+    /// Stream the data
+    CreateDir { name: String },
 }
 
 fn main() -> Result<()> {
     dotenv().ok();
-    let proxy_base = std::env::var("PROXY_BASE").expect("PROXY_BASE must be set.");
     let cli = Cli::parse();
     let mut conn =
         Connection::open(&cli.db).with_context(|| format!("opening db: {}", cli.db.display()))?;
@@ -88,13 +90,24 @@ fn main() -> Result<()> {
             list_files(&mut conn)?;
         }
         Commands::Export { file_id, out } => {
+            let proxy_base = std::env::var("PROXY_BASE").expect("PROXY_BASE must be set.");
             export_file(&mut conn, file_id, &proxy_base, Some(out))?;
         }
         Commands::Verify { file_id } => {
             verify_file(&mut conn, file_id)?;
         }
         Commands::Stream { file_id } => {
+            let proxy_base = std::env::var("PROXY_BASE").expect("PROXY_BASE must be set.");
             export_to_stdout(&mut conn, file_id, &proxy_base)?;
+        }
+        Commands::CreateDir { name } => {
+            let id = create_directory(&mut conn, &name.as_str(), None)?;
+            println!("Created directory '{}' with id {}", name, id);
+        }
+        Commands::ListDirs => {
+            for (id, name) in list_directories(&conn, None)? {
+                println!("{} - {}", id, name);
+            }
         }
     }
 
@@ -331,7 +344,76 @@ fn init_schema(conn: &mut Connection) -> Result<()> {
         )",
         [],
     )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS directories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            parent_id INTEGER,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(parent_id) REFERENCES directories(id)
+        )",
+        [],
+    )?;
     Ok(())
+}
+
+pub fn create_directory(conn: &mut Connection, name: &str, parent_id: Option<i64>) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO directories (name, parent_id, created_at) VALUES (?1, ?2, datetime('now'))",
+        params![name, parent_id],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn list_files_in_directory(
+    conn: &Connection,
+    dir_id: Option<i64>,
+) -> Result<Vec<(i64, String)>> {
+    let mut stmt = match dir_id {
+        Some(_) => conn.prepare("SELECT id, filename FROM files WHERE directory_id = ?1"),
+        None => conn.prepare("SELECT id, filename FROM files WHERE directory_id IS NULL"),
+    }?;
+
+    let rows: Vec<(i64, String)> = match dir_id {
+        Some(did) => stmt
+            .query_map(params![did], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        None => stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+    };
+
+    Ok(rows)
+}
+
+pub fn move_file_to_directory(
+    conn: &mut Connection,
+    file_id: i64,
+    dir_id: Option<i64>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE files SET directory_id = ?1 WHERE id = ?2",
+        params![dir_id, file_id],
+    )?;
+    Ok(())
+}
+
+pub fn list_directories(conn: &Connection, parent_id: Option<i64>) -> Result<Vec<(i64, String)>> {
+    let mut stmt = match parent_id {
+        Some(_) => conn.prepare("SELECT id, name FROM directories WHERE parent_id = ?1"),
+        None => conn.prepare("SELECT id, name FROM directories WHERE parent_id IS NULL"),
+    }?;
+
+    let rows: Vec<(i64, String)> = match parent_id {
+        Some(pid) => stmt
+            .query_map(params![pid], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        None => stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+    };
+
+    Ok(rows)
 }
 
 fn verify_file(conn: &mut Connection, file_id: i64) -> Result<()> {
