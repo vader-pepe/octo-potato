@@ -1,14 +1,13 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use dotenv::dotenv;
 use rand::Rng;
 use rayon::prelude::*;
 use reqwest::blocking::Client;
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -26,7 +25,7 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_DB)]
     db: PathBuf,
 
-    #[arg(long)]
+    #[arg(long, short)]
     webhook: String,
 
     #[command(subcommand)]
@@ -40,6 +39,7 @@ enum Commands {
     /// Ingest a file into the database as 2MB chunks
     Ingest {
         /// Path to the file to ingest
+        #[arg(long, short)]
         path: PathBuf,
         /// Optional override for chunk size in bytes
         #[arg(long)]
@@ -49,23 +49,44 @@ enum Commands {
     List,
     /// List directories
     ListDirs,
+    ListFileInDir {
+        /// ID of the directory
+        #[arg(long)]
+        dir_id: i64,
+    },
     /// Export (reconstruct) a stored file by ID
     Export {
         /// ID from the `files` table
+        #[arg(long)]
         file_id: i64,
         /// Output path to write the reconstructed file
+        #[arg(long, short)]
         out: PathBuf,
     },
     /// Verify checksums of chunks for a file
-    Verify { file_id: i64 },
-    /// Stream the data
-    Stream { file_id: i64 },
+    Verify {
+        /// ID from the `files` table
+        #[arg(long)]
+        file_id: i64,
+    },
+    /// Move file to a directory
+    MoveFile {
+        /// ID from the `files` table
+        #[arg(long)]
+        file_id: i64,
+        /// ID of the directory
+        #[arg(long)]
+        dir_id: i64,
+    },
     /// Create new directory
-    CreateDir { name: String },
+    CreateDir {
+        /// Directory name
+        #[arg(long)]
+        name: String,
+    },
 }
 
 fn main() -> Result<()> {
-    dotenv().ok();
     let cli = Cli::parse();
     let data_dir = Path::new("app-data");
     if !data_dir.exists() {
@@ -81,7 +102,7 @@ fn main() -> Result<()> {
         }
         Commands::Ingest { path, chunk_size } => {
             init_schema(&mut conn)?;
-            let webhook = std::env::var("WEBHOOK").expect("WEBHOOK must be set.");
+            let webhook = cli.webhook.as_str();
             let file_id = ingest_file(
                 &mut conn,
                 &path,
@@ -100,10 +121,6 @@ fn main() -> Result<()> {
         Commands::Verify { file_id } => {
             verify_file(&mut conn, file_id)?;
         }
-        Commands::Stream { file_id } => {
-            let proxy_base = std::env::var("PROXY_BASE").expect("PROXY_BASE must be set.");
-            export_to_stdout(&mut conn, file_id, &proxy_base)?;
-        }
         Commands::CreateDir { name } => {
             let id = create_directory(&mut conn, &name.as_str(), None)?;
             println!("Created directory '{}' with id {}", name, id);
@@ -112,6 +129,12 @@ fn main() -> Result<()> {
             for (id, name) in list_directories(&conn, None)? {
                 println!("{} - {}", id, name);
             }
+        }
+        Commands::MoveFile { file_id, dir_id } => {
+            move_file_to_directory(&mut conn, file_id, Some(dir_id))?;
+        }
+        Commands::ListFileInDir { dir_id } => {
+            list_files_in_directory(&conn, Some(dir_id))?;
         }
     }
 
@@ -178,30 +201,6 @@ fn export_file(
         eprintln!("Downloading chunk {idx} via {proxied_url}");
         let mut resp = client.get(&proxied_url).send()?;
         std::io::copy(&mut resp, &mut out_writer)?;
-    }
-
-    Ok(())
-}
-
-fn export_to_stdout(conn: &mut Connection, file_id: i64, proxy_base: &str) -> Result<()> {
-    let mut stmt =
-        conn.prepare("SELECT idx, url FROM file_chunks WHERE file_id = ?1 ORDER BY idx ASC")?;
-    let chunks = stmt.query_map([file_id], |row| {
-        let idx: i64 = row.get(0)?;
-        let url: String = row.get(1)?;
-        Ok((idx, url))
-    })?;
-
-    let client = reqwest::blocking::Client::new();
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
-
-    for chunk in chunks {
-        let (idx, url) = chunk?;
-        let proxied_url = format!("{proxy_base}/?{url}");
-        eprintln!("Downloading chunk {idx} via {proxied_url}");
-        let mut resp = client.get(&proxied_url).send()?;
-        io::copy(&mut resp, &mut handle)?;
     }
 
     Ok(())
@@ -361,7 +360,7 @@ fn init_schema(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-pub fn create_directory(conn: &mut Connection, name: &str, parent_id: Option<i64>) -> Result<i64> {
+fn create_directory(conn: &mut Connection, name: &str, parent_id: Option<i64>) -> Result<i64> {
     conn.execute(
         "INSERT INTO directories (name, parent_id, created_at) VALUES (?1, ?2, datetime('now'))",
         params![name, parent_id],
@@ -369,13 +368,10 @@ pub fn create_directory(conn: &mut Connection, name: &str, parent_id: Option<i64
     Ok(conn.last_insert_rowid())
 }
 
-pub fn list_files_in_directory(
-    conn: &Connection,
-    dir_id: Option<i64>,
-) -> Result<Vec<(i64, String)>> {
+fn list_files_in_directory(conn: &Connection, dir_id: Option<i64>) -> Result<Vec<(i64, String)>> {
     let mut stmt = match dir_id {
-        Some(_) => conn.prepare("SELECT id, filename FROM files WHERE directory_id = ?1"),
-        None => conn.prepare("SELECT id, filename FROM files WHERE directory_id IS NULL"),
+        Some(_) => conn.prepare("SELECT id, filename FROM files WHERE id = ?1"),
+        None => conn.prepare("SELECT id, filename FROM files WHERE id IS NULL"),
     }?;
 
     let rows: Vec<(i64, String)> = match dir_id {
@@ -390,11 +386,7 @@ pub fn list_files_in_directory(
     Ok(rows)
 }
 
-pub fn move_file_to_directory(
-    conn: &mut Connection,
-    file_id: i64,
-    dir_id: Option<i64>,
-) -> Result<()> {
+fn move_file_to_directory(conn: &mut Connection, file_id: i64, dir_id: Option<i64>) -> Result<()> {
     conn.execute(
         "UPDATE files SET directory_id = ?1 WHERE id = ?2",
         params![dir_id, file_id],
@@ -402,7 +394,7 @@ pub fn move_file_to_directory(
     Ok(())
 }
 
-pub fn list_directories(conn: &Connection, parent_id: Option<i64>) -> Result<Vec<(i64, String)>> {
+fn list_directories(conn: &Connection, parent_id: Option<i64>) -> Result<Vec<(i64, String)>> {
     let mut stmt = match parent_id {
         Some(_) => conn.prepare("SELECT id, name FROM directories WHERE parent_id = ?1"),
         None => conn.prepare("SELECT id, name FROM directories WHERE parent_id IS NULL"),

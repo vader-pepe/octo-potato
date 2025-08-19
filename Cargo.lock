@@ -306,25 +306,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "discord-storage"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "dotenv",
- "hex",
- "humantime",
- "rand",
- "rayon",
- "reqwest",
- "rusqlite",
- "serde_json",
- "sha2",
- "walkdir",
-]
-
-[[package]]
 name = "displaydoc"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -334,12 +315,6 @@ dependencies = [
  "quote",
  "syn",
 ]
-
-[[package]]
-name = "dotenv"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77c90badedccf4105eca100756a0b1289e191f6fcbdadd3cee1d2f614f97da8f"
 
 [[package]]
 name = "either"
@@ -988,6 +963,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "octo-potato"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "hex",
+ "humantime",
+ "rand",
+ "rayon",
+ "reqwest",
+ "rusqlite",
+ "serde_json",
+ "sha2",
+ "walkdir",
 ]
 
 [[package]]
