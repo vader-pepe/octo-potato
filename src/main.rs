@@ -60,7 +60,7 @@ enum Commands {
     Verify { file_id: i64 },
     /// Stream the data
     Stream { file_id: i64 },
-    /// Stream the data
+    /// Create new directory
     CreateDir { name: String },
 }
 
