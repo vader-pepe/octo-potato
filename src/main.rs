@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use rand::Rng;
-use rayon::prelude::*;
 use reqwest::blocking::Client;
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
@@ -232,43 +231,75 @@ fn ingest_file(
     let dir = PathBuf::from("storage").join(file_id.to_string());
     fs::create_dir_all(&dir)?;
 
-    // Read all chunks into memory first
-    let mut chunks: Vec<(usize, Vec<u8>)> = Vec::new();
+    let client = Client::new();
+    let results: Arc<Mutex<Vec<(usize, (String, String))>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Create a channel for processing chunks with bounded capacity to control memory usage
+    let (tx, rx) = crossbeam_channel::bounded(3); // Limit to 3 chunks in flight
+
+    // Spawn worker threads for parallel processing
+    let num_workers = 3;
+    let mut handles = Vec::new();
+
+    for _ in 0..num_workers {
+        let rx = rx.clone();
+        let results = Arc::clone(&results);
+        let client = client.clone();
+        let webhook = webhook.to_string();
+        let dir = dir.clone();
+
+        let handle = thread::spawn(move || {
+            while let Ok((idx, data)) = rx.recv() {
+                let chunk_path = dir.join(format!("{}.chunk", idx));
+
+                // Write chunk to disk
+                if let Err(e) = fs::write(&chunk_path, &data) {
+                    eprintln!("[Chunk {}] Failed to write chunk: {}", idx, e);
+                    continue;
+                }
+
+                // Upload with retry logic
+                match upload_chunk_with_retry(&client, &webhook, &chunk_path, idx) {
+                    Ok(res) => {
+                        results.lock().unwrap().push(res);
+                    }
+                    Err(e) => {
+                        eprintln!("[Chunk {}] Failed permanently: {}", idx, e);
+                    }
+                }
+
+                // Add a random delay after each upload to spread requests
+                let delay = rand::rng().random_range(2..=6);
+                thread::sleep(Duration::from_secs(delay));
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    // Read and process file in chunks without loading everything into memory
     let mut buffer = vec![0u8; chunk_size];
     let mut idx = 0;
+
     loop {
         let n = f.read(&mut buffer)?;
         if n == 0 {
             break;
         }
-        chunks.push((idx, buffer[..n].to_vec()));
+
+        // Send chunk to worker threads
+        let chunk_data = buffer[..n].to_vec();
+        tx.send((idx, chunk_data))?;
         idx += 1;
     }
 
-    let client = Client::new();
-    let results: Arc<Mutex<Vec<(usize, (String, String))>>> = Arc::new(Mutex::new(Vec::new()));
+    // Close the channel to signal workers to exit
+    drop(tx);
 
-    // Limit parallelism to avoid burst (e.g. 3 concurrent uploads)
-    chunks.chunks(3).for_each(|chunk_group| {
-        chunk_group.par_iter().for_each(|(idx, data)| {
-            let chunk_path = dir.join(format!("{}.chunk", idx));
-            let mut chunk_file = File::create(&chunk_path).unwrap();
-            chunk_file.write_all(&data).unwrap();
-
-            match upload_chunk_with_retry(&client, webhook, &chunk_path, *idx) {
-                Ok(res) => {
-                    results.lock().unwrap().push(res);
-                }
-                Err(e) => {
-                    eprintln!("[Chunk {}] Failed permanently: {}", idx, e);
-                }
-            }
-
-            // Add a random delay after each upload to spread requests
-            let delay = rand::rng().random_range(2..=6);
-            thread::sleep(Duration::from_secs(delay));
-        });
-    });
+    // Wait for all workers to finish
+    for handle in handles {
+        handle.join().unwrap();
+    }
 
     // Insert results sequentially
     let mut results = Arc::try_unwrap(results).unwrap().into_inner().unwrap();
